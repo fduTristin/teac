@@ -70,8 +70,16 @@ pub struct StructDef {
     pub decls: VarDeclList,
 }
 
+/// `&self` / `&mut self` as the first parameter in a method.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelfParam {
+    Ref,
+    RefMut,
+}
+
 #[derive(Debug, Clone)]
 pub struct ParamDecl {
+    pub self_param: Option<SelfParam>,
     pub decls: VarDeclList,
 }
 

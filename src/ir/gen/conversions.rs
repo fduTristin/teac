@@ -26,7 +26,11 @@ fn base_dtype(type_specifier: &Option<ast::TypeSpecifier>) -> Dtype {
             element: Box::new(base_dtype(&Some(inner.as_ref().clone()))),
             length: None,
         }),
-        Some(ast::TypeSpecifierInner::BuiltIn(_)) | None => Dtype::I32,
+        Some(ast::TypeSpecifierInner::Array { elem, len }) => {
+            Dtype::array_of(Dtype::from(elem.as_ref()), *len)
+        }
+        Some(ast::TypeSpecifierInner::BuiltIn(ast::BuiltIn::Float)) => Dtype::F32,
+        Some(ast::TypeSpecifierInner::BuiltIn(ast::BuiltIn::Int)) | None => Dtype::I32,
     }
 }
 
@@ -82,7 +86,8 @@ impl From<ast::TypeSpecifier> for Dtype {
 impl From<&ast::TypeSpecifier> for Dtype {
     fn from(a: &ast::TypeSpecifier) -> Self {
         match &a.inner {
-            ast::TypeSpecifierInner::BuiltIn(_) => Self::I32,
+            ast::TypeSpecifierInner::BuiltIn(ast::BuiltIn::Int) => Self::I32,
+            ast::TypeSpecifierInner::BuiltIn(ast::BuiltIn::Float) => Self::F32,
             ast::TypeSpecifierInner::Composite(name) => Self::Struct {
                 type_name: name.to_string(),
             },
@@ -90,6 +95,9 @@ impl From<&ast::TypeSpecifier> for Dtype {
                 element: Box::new(Self::from(inner.as_ref())),
                 length: None,
             }),
+            ast::TypeSpecifierInner::Array { elem, len } => {
+                Self::array_of(Self::from(elem.as_ref()), *len)
+            }
         }
     }
 }

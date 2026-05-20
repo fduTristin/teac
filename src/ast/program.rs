@@ -6,11 +6,18 @@ pub struct UseStmt {
 }
 
 #[derive(Debug, Clone)]
+pub struct ImplDef {
+    pub type_name: String,
+    pub fns: Vec<FnDef>,
+}
+
+#[derive(Debug, Clone)]
 pub enum ProgramElementInner {
     VarDeclStmt(Box<VarDeclStmt>),
     StructDef(Box<StructDef>),
     FnDeclStmt(Box<FnDeclStmt>),
     FnDef(Box<FnDef>),
+    ImplDef(Box<ImplDef>),
 }
 
 #[derive(Debug, Clone)]

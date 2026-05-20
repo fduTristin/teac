@@ -1,5 +1,5 @@
 use super::ops::*;
-use super::types::Pos;
+use super::types::{Pos, TypeSpecifier};
 
 #[derive(Debug, Clone)]
 pub struct LeftVal {
@@ -107,6 +107,8 @@ pub struct FnCall {
     pub module_prefix: Option<String>,
     pub name: String,
     pub vals: RightValList,
+    /// `recv.method(args)` — when set, this is a method call (receiver is the `self` argument).
+    pub receiver: Option<Box<LeftVal>>,
 }
 
 impl FnCall {
@@ -120,14 +122,22 @@ impl FnCall {
 }
 
 #[derive(Debug, Clone)]
+pub struct CastExpr {
+    pub base: Box<ExprUnit>,
+    pub target: TypeSpecifier,
+}
+
+#[derive(Debug, Clone)]
 pub enum ExprUnitInner {
     Num(i32),
+    Float(f32),
     Id(String),
     ArithExpr(Box<ArithExpr>),
     FnCall(Box<FnCall>),
     ArrayExpr(Box<ArrayExpr>),
     MemberExpr(Box<MemberExpr>),
     Reference(String),
+    Cast(Box<CastExpr>),
 }
 
 #[derive(Debug, Clone)]

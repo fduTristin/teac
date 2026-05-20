@@ -54,6 +54,11 @@ impl<'a> Generator for IrGenerator<'a> {
                 FnDeclStmt(fn_decl) => self.handle_fn_decl(fn_decl)?,
                 FnDef(fn_def) => self.handle_fn_def(fn_def)?,
                 StructDef(struct_def) => self.handle_struct_def(struct_def)?,
+                ImplDef(impl_def) => {
+                    for fn_def in impl_def.fns.iter() {
+                        self.handle_fn_def(fn_def)?;
+                    }
+                }
             }
         }
 
@@ -92,6 +97,37 @@ impl<'a> Generator for IrGenerator<'a> {
                     return Err(Error::FunctionNotDefined {
                         symbol: fn_def.fn_decl.identifier.clone(),
                     });
+                }
+            }
+            if let ImplDef(impl_def) = &elem.inner {
+                for fn_def in impl_def.fns.iter() {
+                    let (next_vreg, blocks, local_variables, arguments) = {
+                        let mut function_generator =
+                            FunctionGenerator::new(&self.registry, &self.module.global_list);
+                        function_generator.generate(fn_def)?;
+
+                        let next_vreg = function_generator.next_vreg;
+                        let blocks = Self::harvest_function_irs(function_generator.irs);
+                        let local_variables = function_generator.local_variables;
+                        let arguments = function_generator.arguments;
+                        (next_vreg, blocks, local_variables, arguments)
+                    };
+
+                    let func = self
+                        .module
+                        .function_list
+                        .get_mut(&fn_def.fn_decl.identifier);
+
+                    if let Some(f) = func {
+                        f.blocks = Some(blocks);
+                        f.local_variables = Some(local_variables);
+                        f.arguments = arguments;
+                        f.next_vreg = next_vreg;
+                    } else {
+                        return Err(Error::FunctionNotDefined {
+                            symbol: fn_def.fn_decl.identifier.clone(),
+                        });
+                    }
                 }
             }
         }

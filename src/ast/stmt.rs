@@ -1,5 +1,5 @@
 use super::decl::VarDeclStmt;
-use super::expr::{BoolUnit, FnCall, LeftVal, RightVal};
+use super::expr::{ArithExpr, BoolUnit, FnCall, LeftVal, RightVal};
 
 #[derive(Debug, Clone)]
 pub struct AssignmentStmt {
@@ -40,12 +40,30 @@ pub struct WhileStmt {
 }
 
 #[derive(Debug, Clone)]
+pub enum RangeBound {
+    Arith(Box<ArithExpr>),
+    FnCall(Box<FnCall>),
+    Float(f32),
+    Num(i32),
+    Id(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct ForStmt {
+    pub iter_var: String,
+    pub start: Box<RangeBound>,
+    pub end: Box<RangeBound>,
+    pub stmts: CodeBlockStmtList,
+}
+
+#[derive(Debug, Clone)]
 pub enum CodeBlockStmtInner {
     VarDecl(Box<VarDeclStmt>),
     Assignment(Box<AssignmentStmt>),
     Call(Box<CallStmt>),
     If(Box<IfStmt>),
     While(Box<WhileStmt>),
+    For(Box<ForStmt>),
     Return(Box<ReturnStmt>),
     Continue(Box<ContinueStmt>),
     Break(Box<BreakStmt>),

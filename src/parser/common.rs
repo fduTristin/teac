@@ -80,3 +80,9 @@ pub(crate) fn parse_num(pair: Pair) -> ParseResult<i32> {
         source,
     })
 }
+
+pub(crate) fn parse_float_literal(pair: &Pair<'_>) -> ParseResult<f32> {
+    pair.as_str()
+        .parse()
+        .map_err(|_| grammar_error("float_literal", pair))
+}

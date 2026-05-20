@@ -83,6 +83,15 @@ num = @{
     | (ASCII_NONZERO_DIGIT ~ ASCII_DIGIT*)
 }
 
+// Floating-point literal: optional integer part, dot, fractional digits (atomic; no spaces inside)
+// Examples: "3.14", "2.0", ".5", "0.001"
+float_literal = @{
+    ASCII_DIGIT* ~ "." ~ ASCII_DIGIT+
+}
+
+// Range operator for for-in loops (must be one token, not two dots)
+dot_dot = @{ ".." }
+
 // Keywords (using @ for atomic rules to prevent whitespace inside)
 // Example: "let x:i32 = 0;"
 kw_let = @{ "let" ~ WHITESPACE }
@@ -104,6 +113,18 @@ kw_continue = @{ "continue" ~ &(WHITESPACE | semicolon) }
 kw_return = @{ "return" ~ &(WHITESPACE | semicolon) }
 // Example: "let count:i32 = 0;"
 kw_i32 = @{ "i32" ~ &(WHITESPACE | semicolon | comma | rparen | lbrace | rbrace | rbracket | op_assign) }
+// Example: "let x:f32 = 1.0;"
+kw_f32 = @{ "f32" ~ &(WHITESPACE | semicolon | comma | rparen | lbrace | rbrace | rbracket | op_assign) }
+// Example: "x as f32"
+kw_as = @{ "as" ~ WHITESPACE }
+// Example: "for i in 0..10 { }"
+kw_for = @{ "for" ~ WHITESPACE }
+kw_in = @{ "in" ~ WHITESPACE }
+// Example: "impl Counter { }"
+kw_impl = @{ "impl" ~ WHITESPACE }
+// Example: "&self", "&mut self" in methods
+kw_mut = @{ "mut" ~ WHITESPACE }
+kw_self = @{ "self" ~ &(WHITESPACE | comma | rparen) }
 // Example: "use std;"
 kw_use = @{ "use" ~ WHITESPACE }
 
@@ -121,11 +142,18 @@ ref_type = {
     ampersand ~ lbracket ~ type_spec ~ rbracket
 }
 
-// Type specification: integer type, user-defined type, or reference type
-// Examples: "i32", "Node", "Queue", "&[i32]"
+// Array type: [T; n] with nested type T (supports multidimensional arrays)
+array_type = {
+    lbracket ~ type_spec ~ semicolon ~ num ~ rbracket
+}
+
+// Type specification: reference, array, builtins, or user-defined type
+// Examples: "i32", "f32", "Node", "&[i32]", "[[i32; 4]; 3]"
 type_spec = {
     ref_type
+    | array_type
     | kw_i32
+    | kw_f32
     | identifier
 }
 
@@ -150,6 +178,7 @@ program_element = {
     | struct_def
     | fn_decl_stmt
     | fn_def
+    | impl_def
 }
 
 // Struct definition
@@ -161,10 +190,9 @@ struct_def = {
 
 // Typed variable declaration: must have a type annotation (no untyped scalars)
 // Used for struct fields and function parameters where types are mandatory
-// Examples: "n:i32", "arr: [i32; 100]", "input: &[i32]"
+// Examples: "n:i32", "arr: [i32; 100]", "input: &[i32]", "m: [[i32; 4]; 3]"
 typed_var_decl = {
-    identifier ~ colon ~ lbracket ~ type_spec ~ semicolon ~ num ~ rbracket  // array with type
-    | identifier ~ colon ~ type_spec  // scalar with type (also handles &[T] via type_spec)
+    identifier ~ colon ~ type_spec
 }
 
 // Typed variable declaration list: comma-separated typed declarations
@@ -176,8 +204,7 @@ typed_var_decl_list = {
 // Variable declaration: can be array or scalar, with or without type annotation
 // Examples: "n:i32", "arr: [i32; 100]", "count", "input: &[i32]"
 var_decl = {
-    identifier ~ colon ~ lbracket ~ type_spec ~ semicolon ~ num ~ rbracket  // array with type
-    | identifier ~ colon ~ type_spec  // scalar with type (also handles &[T] via type_spec)
+    identifier ~ colon ~ type_spec
     | identifier  // scalar without type
 }
 
@@ -198,9 +225,9 @@ array_initializer = {
 // Variable definition with initialization
 // Examples: "let x:i32 = 0;", "let arr: [i32; 3] = [1, 2, 3];"
 var_def = {
-    identifier ~ colon ~ lbracket ~ type_spec ~ semicolon ~ num ~ rbracket ~ op_assign ~ array_initializer  // array with type
-    | identifier ~ colon ~ type_spec ~ op_assign ~ right_val  // scalar with type
-    | identifier ~ op_assign ~ right_val  // scalar without type
+    identifier ~ colon ~ array_type ~ op_assign ~ array_initializer
+    | identifier ~ colon ~ type_spec ~ op_assign ~ right_val
+    | identifier ~ op_assign ~ right_val
 }
 
 // Function declarations and definitions
@@ -219,14 +246,26 @@ fn_decl = {
 
 // Parameter declaration: list of parameter variables (types required)
 // Example: "x:i32, y:i32" in "fn add(x:i32, y:i32) -> i32 { }"
+// Methods: "&self", "&mut self, delta:i32"
 param_decl = {
-    typed_var_decl_list
+    self_param ~ (comma ~ typed_var_decl_list)?
+    | typed_var_decl_list
+}
+
+self_param = {
+    ampersand ~ kw_mut ~ kw_self
+    | ampersand ~ kw_self
 }
 
 // Function definition: declaration with implementation
 // Example: "fn main() -> i32 { let x:i32 = 0; return x; }"
 fn_def = {
     fn_decl ~ lbrace ~ code_block_stmt* ~ rbrace
+}
+
+// Impl block: methods for a struct type
+impl_def = {
+    kw_impl ~ identifier ~ lbrace ~ fn_def* ~ rbrace
 }
 
 // Statements
@@ -238,10 +277,24 @@ code_block_stmt = {
     | call_stmt
     | if_stmt
     | while_stmt
+    | for_stmt
     | return_stmt
     | continue_stmt
     | break_stmt
     | null_stmt
+}
+
+// For-in loop: for i in start..end { ... }  (half-open range)
+for_stmt = {
+    kw_for ~ identifier ~ kw_in ~ range_bound ~ dot_dot ~ range_bound ~ lbrace ~ code_block_stmt* ~ rbrace
+}
+
+range_bound = {
+    lparen ~ arith_expr ~ rparen
+    | fn_call
+    | float_literal
+    | num
+    | identifier
 }
 
 // Assignment statement: assign a value to a variable, array element, or struct field
@@ -356,10 +409,15 @@ arith_expr = {
     arith_term ~ (arith_add_op ~ arith_term)*
 }
 
+// Cast binds tighter than + - / * (see cast_expr inside arith_term)
+cast_expr = {
+    expr_unit ~ (kw_as ~ type_spec)?
+}
+
 // Arithmetic term: multiplication and division (higher precedence)
-// Examples: "x * 10", "num / base", "a * b / c"
+// Examples: "x * 10", "num / base", "a * b / c", "a * b as f32"
 arith_term = {
-    expr_unit ~ (arith_mul_op ~ expr_unit)*
+    cast_expr ~ (arith_mul_op ~ cast_expr)*
 }
 
 // Addition and subtraction operators
@@ -371,21 +429,29 @@ arith_mul_op = { op_mul | op_div }
 
 // Expression units (primary expressions)
 // Using postfix syntax to handle chaining: id[0].member[1]
-// Examples: "x", "10", "arr[i]", "node.value", "std::getint()", "0-x" (negative), "&arr"
+// Examples: "x", "10", "arr[i]", "node.value", "std::getint()", "0-x" (negative), "&arr", "3.14", "-2.5"
 expr_unit = {
     lparen ~ arith_expr ~ rparen
     | fn_call
     | ampersand ~ identifier           // address-of: &arr produces &[T] reference from array
-    | op_sub ~ num  // negative number
+    | op_sub ~ float_literal
+    | op_sub ~ num
+    | float_literal
     | num
     | identifier ~ expr_suffix*
+}
+
+// Suffixes for method-call base: index or field, but not ".name(" (method)
+expr_suffix_non_method = {
+    lbracket ~ index_expr ~ rbracket
+    | dot ~ identifier ~ !(lparen)
 }
 
 // Expression suffix: array indexing or member access (can be chained)
 // Examples: "[i]" in "arr[i]", ".value" in "node.value", "[cnt].next" in "list[cnt].next"
 expr_suffix = {
-    lbracket ~ index_expr ~ rbracket  // array indexing
-    | dot ~ identifier  // member access
+    lbracket ~ index_expr ~ rbracket
+    | dot ~ identifier ~ !(lparen)
 }
 
 // Index expression: numeric or variable index for array access
@@ -401,11 +467,16 @@ left_val = {
 }
 
 // Function calls
-// Function call: either module-prefixed or local
-// Examples: "std::getint()", "quickread()", "addedge(x, y)"
+// Function call: module-prefixed, method, or local
+// Examples: "std::getint()", "quickread()", "obj.method()", "Counter::get(c)"
 fn_call = {
     module_prefixed_call
+    | method_call
     | local_call
+}
+
+method_call = {
+    identifier ~ expr_suffix_non_method* ~ dot ~ identifier ~ lparen ~ right_val_list? ~ rparen
 }
 
 // Function call with module prefix, supporting multi-level paths

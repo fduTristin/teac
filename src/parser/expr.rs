@@ -1,6 +1,6 @@
 use crate::ast;
 
-use super::common::{get_pos, grammar_error, parse_num, Pair, ParseResult, Rule};
+use super::common::{get_pos, grammar_error, parse_float_literal, parse_num, Pair, ParseResult, Rule};
 use super::ParseContext;
 
 impl<'a> ParseContext<'a> {
@@ -257,7 +257,7 @@ impl<'a> ParseContext<'a> {
             return Err(grammar_error("arith_term", &pair_for_error));
         }
 
-        let first_unit = self.parse_expr_unit(inner_pairs[0].clone())?;
+        let first_unit = self.parse_cast_expr(inner_pairs[0].clone())?;
         let mut expr = Box::new(ast::ArithExpr {
             pos: first_unit.pos,
             inner: ast::ArithExprInner::ExprUnit(first_unit),
@@ -267,7 +267,7 @@ impl<'a> ParseContext<'a> {
         while i < inner_pairs.len() {
             if inner_pairs[i].as_rule() == Rule::arith_mul_op {
                 let op = self.parse_arith_mul_op(inner_pairs[i].clone())?;
-                let right_unit = self.parse_expr_unit(inner_pairs[i + 1].clone())?;
+                let right_unit = self.parse_cast_expr(inner_pairs[i + 1].clone())?;
                 let right = Box::new(ast::ArithExpr {
                     pos: right_unit.pos,
                     inner: ast::ArithExprInner::ExprUnit(right_unit),
@@ -284,6 +284,32 @@ impl<'a> ParseContext<'a> {
                 i += 2;
             } else {
                 i += 1;
+            }
+        }
+
+        Ok(expr)
+    }
+
+    fn parse_cast_expr(&self, pair: Pair) -> ParseResult<Box<ast::ExprUnit>> {
+        let pair_for_error = pair.clone();
+        let mut inner = pair.into_inner();
+        let expr_unit_pair = inner
+            .next()
+            .ok_or_else(|| grammar_error("cast_expr.expr_unit", &pair_for_error))?;
+        let mut expr = self.parse_expr_unit(expr_unit_pair)?;
+
+        if let Some(kw) = inner.next() {
+            if kw.as_rule() == Rule::kw_as {
+                let ts_pair = inner
+                    .next()
+                    .ok_or_else(|| grammar_error("cast_expr.type_spec", &pair_for_error))?;
+                let target = self
+                    .parse_type_spec(ts_pair)?
+                    .ok_or_else(|| grammar_error("cast_expr.type_spec", &pair_for_error))?;
+                expr = Box::new(ast::ExprUnit {
+                    pos: expr.pos,
+                    inner: ast::ExprUnitInner::Cast(Box::new(ast::CastExpr { base: expr, target })),
+                });
             }
         }
 
@@ -327,6 +353,17 @@ impl<'a> ParseContext<'a> {
 
         if filtered.len() == 2
             && filtered[0].as_rule() == Rule::op_sub
+            && filtered[1].as_rule() == Rule::float_literal
+        {
+            let f = parse_float_literal(&filtered[1])?;
+            return Ok(Box::new(ast::ExprUnit {
+                pos,
+                inner: ast::ExprUnitInner::Float(-f),
+            }));
+        }
+
+        if filtered.len() == 2
+            && filtered[0].as_rule() == Rule::op_sub
             && filtered[1].as_rule() == Rule::num
         {
             let num = parse_num(filtered[1].clone())?;
@@ -347,6 +384,14 @@ impl<'a> ParseContext<'a> {
             return Ok(Box::new(ast::ExprUnit {
                 pos,
                 inner: ast::ExprUnitInner::FnCall(self.parse_fn_call(filtered[0].clone())?),
+            }));
+        }
+
+        if filtered.len() == 1 && filtered[0].as_rule() == Rule::float_literal {
+            let f = parse_float_literal(&filtered[0])?;
+            return Ok(Box::new(ast::ExprUnit {
+                pos,
+                inner: ast::ExprUnitInner::Float(f),
             }));
         }
 
@@ -422,6 +467,9 @@ impl<'a> ParseContext<'a> {
                 Rule::module_prefixed_call => {
                     return self.parse_module_prefixed_call(inner);
                 }
+                Rule::method_call => {
+                    return self.parse_method_call(inner);
+                }
                 Rule::local_call => {
                     return self.parse_local_call(inner);
                 }
@@ -429,6 +477,55 @@ impl<'a> ParseContext<'a> {
             }
         }
         Err(grammar_error("fn_call", &pair_for_error))
+    }
+
+    fn parse_method_call(&self, pair: Pair) -> ParseResult<Box<ast::FnCall>> {
+        let pair_for_error = pair.clone();
+        let inner_pairs: Vec<_> = pair.into_inner().collect();
+
+        if inner_pairs.is_empty() || inner_pairs[0].as_rule() != Rule::identifier {
+            return Err(grammar_error("method_call", &pair_for_error));
+        }
+
+        let pos = get_pos(&inner_pairs[0]);
+        let mut recv = Box::new(ast::LeftVal {
+            pos,
+            inner: ast::LeftValInner::Id(inner_pairs[0].as_str().to_string()),
+        });
+
+        let mut i = 1;
+        while i < inner_pairs.len() && inner_pairs[i].as_rule() == Rule::expr_suffix_non_method {
+            recv = self.parse_expr_suffix(recv, inner_pairs[i].clone())?;
+            i += 1;
+        }
+
+        if inner_pairs.get(i).map(|p| p.as_rule()) != Some(Rule::dot) {
+            return Err(grammar_error("method_call.dot", &pair_for_error));
+        }
+        i += 1;
+
+        let method_pair = inner_pairs
+            .get(i)
+            .filter(|p| p.as_rule() == Rule::identifier)
+            .ok_or_else(|| grammar_error("method_call.name", &pair_for_error))?;
+        let method_name = method_pair.as_str().to_string();
+        i += 1;
+
+        let mut vals = Vec::new();
+        while i < inner_pairs.len() {
+            if inner_pairs[i].as_rule() == Rule::right_val_list {
+                vals = self.parse_right_val_list(inner_pairs[i].clone())?;
+                break;
+            }
+            i += 1;
+        }
+
+        Ok(Box::new(ast::FnCall {
+            module_prefix: None,
+            name: method_name,
+            vals,
+            receiver: Some(recv),
+        }))
     }
 
     fn parse_module_prefixed_call(&self, pair: Pair) -> ParseResult<Box<ast::FnCall>> {
@@ -455,6 +552,7 @@ impl<'a> ParseContext<'a> {
             module_prefix,
             name,
             vals,
+            receiver: None,
         }))
     }
 
@@ -474,6 +572,7 @@ impl<'a> ParseContext<'a> {
             module_prefix: None,
             name,
             vals,
+            receiver: None,
         }))
     }
 

@@ -1,6 +1,7 @@
 use super::expr::*;
 use super::ops::*;
 use super::program::Program;
+use super::stmt::RangeBound;
 use super::tree::DisplayAsTree;
 use super::types::*;
 use std::fmt::{Display, Error, Formatter};
@@ -9,6 +10,7 @@ impl Display for BuiltIn {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), Error> {
         match self {
             BuiltIn::Int => write!(f, "int"),
+            BuiltIn::Float => write!(f, "f32"),
         }
     }
 }
@@ -19,6 +21,9 @@ impl Display for TypeSpecifierInner {
             TypeSpecifierInner::BuiltIn(b) => write!(f, "{}", b),
             TypeSpecifierInner::Composite(name) => write!(f, "{}", name),
             TypeSpecifierInner::Reference(inner) => write!(f, "&[{}]", inner.inner),
+            TypeSpecifierInner::Array { elem, len } => {
+                write!(f, "[{}; {}]", elem.inner, len)
+            }
         }
     }
 }
@@ -196,7 +201,9 @@ impl Display for MemberExpr {
 impl Display for FnCall {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), Error> {
         let args: Vec<String> = self.vals.iter().map(|v| format!("{}", v)).collect();
-        if let Some(module) = &self.module_prefix {
+        if let Some(recv) = &self.receiver {
+            write!(f, "{}.{}({})", recv, self.name, args.join(", "))
+        } else if let Some(module) = &self.module_prefix {
             write!(f, "{}::{}({})", module, self.name, args.join(", "))
         } else {
             write!(f, "{}({})", self.name, args.join(", "))
@@ -204,16 +211,24 @@ impl Display for FnCall {
     }
 }
 
+impl Display for CastExpr {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), Error> {
+        write!(f, "({} as {})", self.base, self.target.inner)
+    }
+}
+
 impl Display for ExprUnitInner {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), Error> {
         match self {
             ExprUnitInner::Num(n) => write!(f, "{}", n),
+            ExprUnitInner::Float(v) => write!(f, "{}", v),
             ExprUnitInner::Id(id) => write!(f, "{}", id),
             ExprUnitInner::ArithExpr(a) => write!(f, "{}", a),
             ExprUnitInner::FnCall(fc) => write!(f, "{}", fc),
             ExprUnitInner::ArrayExpr(ae) => write!(f, "{}", ae),
             ExprUnitInner::MemberExpr(me) => write!(f, "{}", me),
             ExprUnitInner::Reference(id) => write!(f, "&{}", id),
+            ExprUnitInner::Cast(c) => write!(f, "{}", c),
         }
     }
 }
@@ -227,5 +242,17 @@ impl Display for ExprUnit {
 impl Display for Program {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), Error> {
         self.fmt_tree_root(f)
+    }
+}
+
+impl Display for RangeBound {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), Error> {
+        match self {
+            RangeBound::Arith(a) => write!(f, "{}", a),
+            RangeBound::FnCall(c) => write!(f, "{}", c),
+            RangeBound::Float(v) => write!(f, "{}", v),
+            RangeBound::Num(n) => write!(f, "{}", n),
+            RangeBound::Id(id) => write!(f, "{}", id),
+        }
     }
 }

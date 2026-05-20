@@ -78,6 +78,9 @@ pub enum Error {
     #[error("Unsupported return type")]
     ReturnTypeUnsupported,
 
+    #[error("Unsupported statement in IR lowering")]
+    UnsupportedStatement,
+
     #[error("Struct type '{member_type}' used in struct '{struct_name}' is not defined")]
     UndefinedStructMemberType {
         struct_name: String,

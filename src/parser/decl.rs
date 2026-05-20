@@ -3,6 +3,20 @@ use crate::ast;
 use super::common::{get_pos, grammar_error, parse_num, Pair, ParseResult, Rule};
 use super::ParseContext;
 
+fn peel_array_for_var_decl(
+    type_specifier: Option<ast::TypeSpecifier>,
+) -> (Option<ast::TypeSpecifier>, ast::VarDeclInner) {
+    match type_specifier {
+        Some(ts) => match ts.inner {
+            ast::TypeSpecifierInner::Array { elem, len } => {
+                (Some(*elem), ast::VarDeclInner::Array(Box::new(ast::VarDeclArray { len })))
+            }
+            _ => (Some(ts), ast::VarDeclInner::Scalar),
+        },
+        None => (None, ast::VarDeclInner::Scalar),
+    }
+}
+
 impl<'a> ParseContext<'a> {
     pub(crate) fn parse_use_stmt(&self, pair: Pair) -> ParseResult<ast::UseStmt> {
         let parts: Vec<&str> = pair
@@ -45,10 +59,30 @@ impl<'a> ParseContext<'a> {
                         inner: ast::ProgramElementInner::FnDef(self.parse_fn_def(inner)?),
                     })));
                 }
+                Rule::impl_def => {
+                    return Ok(Some(Box::new(ast::ProgramElement {
+                        inner: ast::ProgramElementInner::ImplDef(self.parse_impl_def(inner)?),
+                    })));
+                }
                 _ => {}
             }
         }
         Ok(None)
+    }
+
+    fn parse_impl_def(&self, pair: Pair) -> ParseResult<Box<ast::ImplDef>> {
+        let mut type_name = String::new();
+        let mut fns = Vec::new();
+
+        for inner in pair.into_inner() {
+            match inner.as_rule() {
+                Rule::identifier => type_name = inner.as_str().to_string(),
+                Rule::fn_def => fns.push(*self.parse_fn_def(inner)?),
+                _ => {}
+            }
+        }
+
+        Ok(Box::new(ast::ImplDef { type_name, fns }))
     }
 
     pub(crate) fn parse_struct_def(&self, pair: Pair) -> ParseResult<Box<ast::StructDef>> {
@@ -80,7 +114,6 @@ impl<'a> ParseContext<'a> {
         let pair_for_error = pair.clone();
         let mut identifier: Option<String> = None;
         let mut type_specifier: Option<ast::TypeSpecifier> = None;
-        let mut array_len: Option<usize> = None;
 
         for inner in pair.into_inner() {
             match inner.as_rule() {
@@ -90,20 +123,13 @@ impl<'a> ParseContext<'a> {
                 Rule::type_spec => {
                     type_specifier = self.parse_type_spec(inner)?;
                 }
-                Rule::num => {
-                    array_len = Some(parse_num(inner)? as usize);
-                }
                 _ => {}
             }
         }
 
         let identifier =
             identifier.ok_or_else(|| grammar_error("var_decl.identifier", &pair_for_error))?;
-        let inner = if let Some(len) = array_len {
-            ast::VarDeclInner::Array(Box::new(ast::VarDeclArray { len }))
-        } else {
-            ast::VarDeclInner::Scalar
-        };
+        let (type_specifier, inner) = peel_array_for_var_decl(type_specifier);
 
         Ok(Box::new(ast::VarDecl {
             identifier,
@@ -112,44 +138,72 @@ impl<'a> ParseContext<'a> {
         }))
     }
 
-    pub(crate) fn parse_type_spec(&self, pair: Pair) -> ParseResult<Option<ast::TypeSpecifier>> {
+    fn parse_array_type_as_type_specifier(&self, pair: Pair) -> ParseResult<ast::TypeSpecifier> {
         let pos = get_pos(&pair);
+        let pair_for_error = pair.clone();
+        let mut elem_ts: Option<ast::TypeSpecifier> = None;
+        let mut len: usize = 0;
 
-        let children: Vec<_> = pair.into_inner().collect();
-
-        for child in &children {
-            match child.as_rule() {
-                Rule::ref_type => {
-                    let ref_children: Vec<_> = child.clone().into_inner().collect();
-                    let inner_type_spec = ref_children
-                        .iter()
-                        .find(|c| c.as_rule() == Rule::type_spec)
-                        .expect("Ref type_spec must have inner type_spec");
-                    let inner_ts = self
-                        .parse_type_spec(inner_type_spec.clone())?
-                        .expect("Ref inner type_spec must not be empty");
-                    return Ok(Some(ast::TypeSpecifier {
-                        pos,
-                        inner: ast::TypeSpecifierInner::Reference(Box::new(inner_ts)),
-                    }));
+        for inner in pair.into_inner() {
+            match inner.as_rule() {
+                Rule::type_spec => {
+                    elem_ts = self.parse_type_spec(inner)?;
                 }
-                Rule::kw_i32 => {
-                    return Ok(Some(ast::TypeSpecifier {
-                        pos,
-                        inner: ast::TypeSpecifierInner::BuiltIn(ast::BuiltIn::Int),
-                    }));
-                }
-                Rule::identifier => {
-                    return Ok(Some(ast::TypeSpecifier {
-                        pos,
-                        inner: ast::TypeSpecifierInner::Composite(child.as_str().to_string()),
-                    }));
+                Rule::num => {
+                    len = parse_num(inner)? as usize;
                 }
                 _ => {}
             }
         }
 
-        Ok(None)
+        let elem = elem_ts.ok_or_else(|| grammar_error("array_type.elem", &pair_for_error))?;
+        Ok(ast::TypeSpecifier {
+            pos,
+            inner: ast::TypeSpecifierInner::Array {
+                elem: Box::new(elem),
+                len,
+            },
+        })
+    }
+
+    pub(crate) fn parse_type_spec(&self, pair: Pair) -> ParseResult<Option<ast::TypeSpecifier>> {
+        let pos = get_pos(&pair);
+        let pair_for_error = pair.clone();
+        let child = pair
+            .into_inner()
+            .next()
+            .ok_or_else(|| grammar_error("type_spec", &pair_for_error))?;
+
+        match child.as_rule() {
+            Rule::array_type => Ok(Some(self.parse_array_type_as_type_specifier(child)?)),
+            Rule::ref_type => {
+                let ref_children: Vec<_> = child.into_inner().collect();
+                let inner_type_spec = ref_children
+                    .iter()
+                    .find(|c| c.as_rule() == Rule::type_spec)
+                    .expect("Ref type_spec must have inner type_spec");
+                let inner_ts = self
+                    .parse_type_spec(inner_type_spec.clone())?
+                    .expect("Ref inner type_spec must not be empty");
+                Ok(Some(ast::TypeSpecifier {
+                    pos,
+                    inner: ast::TypeSpecifierInner::Reference(Box::new(inner_ts)),
+                }))
+            }
+            Rule::kw_i32 => Ok(Some(ast::TypeSpecifier {
+                pos,
+                inner: ast::TypeSpecifierInner::BuiltIn(ast::BuiltIn::Int),
+            })),
+            Rule::kw_f32 => Ok(Some(ast::TypeSpecifier {
+                pos,
+                inner: ast::TypeSpecifierInner::BuiltIn(ast::BuiltIn::Float),
+            })),
+            Rule::identifier => Ok(Some(ast::TypeSpecifier {
+                pos,
+                inner: ast::TypeSpecifierInner::Composite(child.as_str().to_string()),
+            })),
+            _ => Err(grammar_error("type_spec", &pair_for_error)),
+        }
     }
 
     pub(crate) fn parse_var_decl_stmt(&self, pair: Pair) -> ParseResult<Box<ast::VarDeclStmt>> {
@@ -185,24 +239,19 @@ impl<'a> ParseContext<'a> {
         let has_colon = inner_pairs.iter().any(|p| p.as_rule() == Rule::colon);
 
         if has_initializer {
-            let len = parse_num(
-                inner_pairs
-                    .iter()
-                    .find(|p| p.as_rule() == Rule::num)
-                    .ok_or_else(|| grammar_error("var_def.array_len", &pair_for_error))?
-                    .clone(),
-            )? as usize;
+            let array_type_pair = inner_pairs
+                .iter()
+                .find(|p| p.as_rule() == Rule::array_type)
+                .ok_or_else(|| grammar_error("var_def.array_type", &pair_for_error))?
+                .clone();
 
-            let type_specifier = if has_colon {
-                self.parse_type_spec(
-                    inner_pairs
-                        .iter()
-                        .find(|p| p.as_rule() == Rule::type_spec)
-                        .ok_or_else(|| grammar_error("var_def.type_spec", &pair_for_error))?
-                        .clone(),
-                )?
-            } else {
-                None
+            let full_ts = self.parse_array_type_as_type_specifier(array_type_pair)?;
+            let (type_specifier, inner_decl) = peel_array_for_var_decl(Some(full_ts));
+            let len = match &inner_decl {
+                ast::VarDeclInner::Array(a) => a.len,
+                _ => {
+                    return Err(grammar_error("var_def.array_len", &pair_for_error));
+                }
             };
 
             let initializer = self.parse_array_initializer(
@@ -309,15 +358,33 @@ impl<'a> ParseContext<'a> {
     }
 
     fn parse_param_decl(&self, pair: Pair) -> ParseResult<Box<ast::ParamDecl>> {
-        let pair_for_error = pair.clone();
+        let mut self_param = None;
+        let mut decls = Vec::new();
+
         for inner in pair.into_inner() {
-            if inner.as_rule() == Rule::typed_var_decl_list {
-                return Ok(Box::new(ast::ParamDecl {
-                    decls: self.parse_typed_var_decl_list(inner)?,
-                }));
+            match inner.as_rule() {
+                Rule::self_param => {
+                    self_param = Some(self.parse_self_param(inner)?);
+                }
+                Rule::typed_var_decl_list => {
+                    decls = self.parse_typed_var_decl_list(inner)?;
+                }
+                _ => {}
             }
         }
-        Err(grammar_error("param_decl", &pair_for_error))
+
+        Ok(Box::new(ast::ParamDecl { self_param, decls }))
+    }
+
+    fn parse_self_param(&self, pair: Pair) -> ParseResult<ast::SelfParam> {
+        let has_mut = pair
+            .into_inner()
+            .any(|p| p.as_rule() == Rule::kw_mut);
+        Ok(if has_mut {
+            ast::SelfParam::RefMut
+        } else {
+            ast::SelfParam::Ref
+        })
     }
 
     pub(crate) fn parse_fn_def(&self, pair: Pair) -> ParseResult<Box<ast::FnDef>> {

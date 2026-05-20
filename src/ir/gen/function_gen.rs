@@ -120,6 +120,7 @@ impl<'ir> FunctionGenerator<'ir> {
             ast::CodeBlockStmtInner::Call(s) => self.handle_call_stmt(s),
             ast::CodeBlockStmtInner::If(s) => self.handle_if_stmt(s, con_label, bre_label),
             ast::CodeBlockStmtInner::While(s) => self.handle_while_stmt(s),
+            ast::CodeBlockStmtInner::For(_) => Err(crate::ir::Error::UnsupportedStatement),
             ast::CodeBlockStmtInner::Return(s) => self.handle_return_stmt(s),
             ast::CodeBlockStmtInner::Continue(_) => self.handle_continue_stmt(con_label),
             ast::CodeBlockStmtInner::Break(_) => self.handle_break_stmt(bre_label),
@@ -220,29 +221,15 @@ impl<'ir> FunctionGenerator<'ir> {
     /// Returns `Deferred` for untyped scalars (type to be resolved at first
     /// assignment), and `Alloca` for typed scalars and all arrays.
     fn plan_local_decl_storage(decl: &ast::VarDecl) -> Result<LocalStoragePlan, Error> {
-        let dtype = decl.type_specifier.as_ref().map(Dtype::from);
-        match (&decl.inner, dtype.as_ref()) {
-            (ast::VarDeclInner::Scalar, None) => Ok(LocalStoragePlan::Deferred),
-            (ast::VarDeclInner::Scalar, Some(Dtype::I32)) => {
-                Ok(LocalStoragePlan::Alloca(Dtype::I32))
+        match &decl.inner {
+            ast::VarDeclInner::Scalar => {
+                if decl.type_specifier.is_none() {
+                    Ok(LocalStoragePlan::Deferred)
+                } else {
+                    Ok(LocalStoragePlan::Alloca(Dtype::try_from(decl)?))
+                }
             }
-            (ast::VarDeclInner::Scalar, Some(Dtype::Struct { type_name })) => {
-                Ok(LocalStoragePlan::Alloca(Dtype::Struct {
-                    type_name: type_name.clone(),
-                }))
-            }
-            (ast::VarDeclInner::Array(arr), None | Some(Dtype::I32)) => Ok(
-                LocalStoragePlan::Alloca(Dtype::array_of(Dtype::I32, arr.len)),
-            ),
-            (ast::VarDeclInner::Array(arr), Some(Dtype::Struct { type_name })) => {
-                Ok(LocalStoragePlan::Alloca(Dtype::array_of(
-                    Dtype::Struct {
-                        type_name: type_name.clone(),
-                    },
-                    arr.len,
-                )))
-            }
-            _ => Err(Error::LocalVarDefinitionUnsupported),
+            ast::VarDeclInner::Array(_) => Ok(LocalStoragePlan::Alloca(Dtype::try_from(decl)?)),
         }
     }
 
@@ -254,6 +241,7 @@ impl<'ir> FunctionGenerator<'ir> {
         match dtype.as_ref() {
             None => Ok(LocalStoragePlan::Deferred),
             Some(Dtype::I32) => Ok(LocalStoragePlan::Alloca(Dtype::I32)),
+            Some(Dtype::F32) => Ok(LocalStoragePlan::Alloca(Dtype::F32)),
             Some(Dtype::Struct { type_name }) => Ok(LocalStoragePlan::Alloca(Dtype::Struct {
                 type_name: type_name.clone(),
             })),
@@ -268,6 +256,7 @@ impl<'ir> FunctionGenerator<'ir> {
     fn plan_local_array_def_storage(dtype: &Option<Dtype>, len: usize) -> Result<Dtype, Error> {
         match dtype.as_ref() {
             None | Some(Dtype::I32) => Ok(Dtype::array_of(Dtype::I32, len)),
+            Some(Dtype::F32) => Ok(Dtype::array_of(Dtype::F32, len)),
             _ => Err(Error::LocalVarDefinitionUnsupported),
         }
     }
@@ -571,6 +560,11 @@ impl<'ir> FunctionGenerator<'ir> {
             }
             ast::ExprUnitInner::ArithExpr(expr) => self.handle_arith_expr(expr),
             ast::ExprUnitInner::FnCall(fn_call) => {
+                if fn_call.receiver.is_some() {
+                    return Err(Error::InvalidExprUnit {
+                        expr_unit: unit.clone(),
+                    });
+                }
                 let name = fn_call.qualified_name();
                 let return_dtype = &self
                     .registry
@@ -582,7 +576,9 @@ impl<'ir> FunctionGenerator<'ir> {
                     .return_dtype;
 
                 let res = match &return_dtype {
-                    Dtype::I32 | Dtype::Struct { .. } => self.alloc_temporary(return_dtype.clone()),
+                    Dtype::I32 | Dtype::F32 | Dtype::Struct { .. } => {
+                        self.alloc_temporary(return_dtype.clone())
+                    }
                     _ => {
                         return Err(Error::InvalidExprUnit {
                             expr_unit: unit.clone(),
@@ -603,6 +599,11 @@ impl<'ir> FunctionGenerator<'ir> {
             ast::ExprUnitInner::MemberExpr(expr) => self.handle_member_expr(expr),
             ast::ExprUnitInner::Reference(id) => {
                 return self.handle_reference_expr(id);
+            }
+            ast::ExprUnitInner::Float(_) | ast::ExprUnitInner::Cast(_) => {
+                Err(Error::InvalidExprUnit {
+                    expr_unit: unit.clone(),
+                })
             }
         }?;
 
