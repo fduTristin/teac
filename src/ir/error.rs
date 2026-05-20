@@ -1,20 +1,28 @@
 use crate::ast;
+use crate::ir::types::Dtype;
 use std::path::PathBuf;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum Error {
+    #[error("Type of variable '{symbol}' has not been determined at point of use")]
+    TypeNotDetermined { symbol: String },
+
+    #[error("Cannot assign type '{actual}' to variable '{symbol}' of type '{expected}'")]
+    TypeMismatch {
+        symbol: String,
+        expected: Dtype,
+        actual: Dtype,
+    },
+
     #[error("Initialization of structs not supported")]
     StructInitialization,
 
     #[error("Module '{module_name}' not found: expected header file at '{}'", path.display())]
-    ModuleNotFound {
-        module_name: String,
-        path: PathBuf,
-    },
+    ModuleNotFound { module_name: String, path: PathBuf },
 
     #[error("Failed to parse module '{module_name}': {message}")]
-    ModuleParseError {
+    ModuleParseFailed {
         module_name: String,
         message: String,
     },
@@ -31,8 +39,14 @@ pub enum Error {
     #[error("Conflicted definition of function {symbol}")]
     ConflictedFunction { symbol: String },
 
-    #[error("Symbol missing")]
-    SymbolMissing,
+    #[error(
+        "Function {symbol} lowers to linker symbol '{link_name}', which is already used by {existing}"
+    )]
+    ConflictedLinkName {
+        symbol: String,
+        existing: String,
+        link_name: String,
+    },
 
     #[error("Mismatched declaration and definition of {symbol}")]
     DeclDefMismatch { symbol: String },
@@ -63,20 +77,14 @@ pub enum Error {
     #[error("Invalid expression unit: {expr_unit}")]
     InvalidExprUnit { expr_unit: ast::ExprUnit },
 
-    #[error("Unsupported local variable definition")]
-    LocalVarDefinitionUnsupported,
-
-    #[error("Unsupported function call")]
-    FunctionCallUnsupported,
-
     #[error("Invalid continue instruction")]
     InvalidContinueInst,
 
     #[error("Invalid break instruction")]
     InvalidBreakInst,
 
-    #[error("Unsupported return type")]
-    ReturnTypeUnsupported,
+    #[error("Function '{symbol}' has unsupported return type '{dtype}'")]
+    UnsupportedReturnType { symbol: String, dtype: Dtype },
 
     #[error("Unsupported statement in IR lowering")]
     UnsupportedStatement,

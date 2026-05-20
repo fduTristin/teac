@@ -54,11 +54,11 @@ fn main() -> i32 {
     let c1: [f32; 3];
     let c2: [f32; 3];
 
-    matmul(a0, a1, a2, b0, b1, b2, c0, c1, c2);
+    matmul(&a0, &a1, &a2, &b0, &b1, &b2, &c0, &c1, &c2);
 
-    print_row(c0);
-    print_row(c1);
-    print_row(c2);
+    print_row(&c0);
+    print_row(&c1);
+    print_row(&c2);
 
     return 0;
 }

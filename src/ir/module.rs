@@ -1,63 +1,49 @@
-//! This module defines the core IR (Intermediate Representation) data structures,
-//! including the Module, Registry, and IrGenerator used for code generation.
+//! Core IR data structures: the [`Module`], the [`Registry`] of type
+//! definitions, and the [`IrGenerator`] that populates them.
 
 use super::function::Function;
 use super::types::FunctionType;
-use super::value::GlobalVariable;
+use super::value::GlobalDef;
 use crate::ast;
+use crate::common::pass::{ModulePass, ModulePassManager};
 use indexmap::IndexMap;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use super::types::StructType;
 
-/// A registry that holds type definitions used during IR generation.
-/// It stores struct type definitions and function type signatures
-/// that are referenced throughout the compilation process.
+/// Type definitions shared across IR generation.
 pub struct Registry {
-    /// A map of struct type names to their corresponding struct type definitions.
     pub struct_types: IndexMap<String, StructType>,
-    /// A map of function type names to their corresponding function type signatures.
     pub function_types: IndexMap<String, FunctionType>,
+    /// Map from a function's source-level (possibly qualified) name to
+    /// the symbol it exports to the linker.  Populated at registration
+    /// time by [`crate::ir::compute_link_name`]; consulted at every
+    /// call site so that the IR's call instructions carry the linker
+    /// name directly.
+    pub link_names: IndexMap<String, String>,
 }
 
-/// Represents a compiled module containing all global variables and functions.
-/// This is the top-level container for the generated IR output.
+/// A compiled module: the top-level container for globals and functions.
 pub struct Module {
-    /// A map of global variable names to their definitions.
-    pub global_list: IndexMap<String, GlobalVariable>,
-    /// A map of function names to their compiled function representations.
+    pub global_list: IndexMap<Rc<str>, GlobalDef>,
     pub function_list: IndexMap<String, Function>,
 }
 
-/// The main IR generator that transforms an AST program into IR.
-/// It holds a reference to the input AST, the output module, and
-/// a registry of type definitions used during the generation process.
+/// Transforms an AST program into IR.
 pub struct IrGenerator<'a> {
-    /// A reference to the input AST program to be compiled.
     pub input: &'a ast::Program,
-    /// The directory containing the source file being compiled.
-    /// Used to resolve module header files (e.g. `std.teah`) relative
-    /// to the source file when processing `use` statements.
+    /// Directory of the source file; used to resolve `use` imports.
     pub source_dir: PathBuf,
-    /// The output module that accumulates generated IR constructs.
     pub module: Module,
-    /// The registry of type definitions available during IR generation.
     pub registry: Registry,
+    /// Module-level plug-in pipeline, run between signature registration
+    /// (Pass 2) and per-function IR generation (Pass 3).
+    pub(crate) module_passes: ModulePassManager,
 }
 
 impl<'a> IrGenerator<'a> {
-    /// The target triple specifying the architecture, vendor, and OS for code generation.
-    pub(crate) const TARGET_TRIPLE: &'static str = "aarch64-unknown-linux-gnu";
-    /// The target data layout string describing the memory layout conventions
-    /// (endianness, alignment, pointer sizes, etc.) for the target platform.
-    pub(crate) const TARGET_DATALAYOUT: &'static str =
-        "e-m:e-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128";
-
-    /// Creates a new `IrGenerator` with the given AST program as input
-    /// and the directory containing the source file.
-    /// The `source_dir` is used to resolve module header files when
-    /// processing `use` statements.
-    /// Initializes an empty module and an empty type registry.
+    /// Create a generator with empty module, registry, and pass pipeline.
     pub fn new(input: &'a ast::Program, source_dir: PathBuf) -> Self {
         let module = Module {
             global_list: IndexMap::new(),
@@ -66,12 +52,23 @@ impl<'a> IrGenerator<'a> {
         let registry = Registry {
             struct_types: IndexMap::new(),
             function_types: IndexMap::new(),
+            link_names: IndexMap::new(),
         };
         Self {
             input,
             source_dir,
             module,
             registry,
+            module_passes: ModulePassManager::new(),
         }
+    }
+
+    /// Append a module-level pass to the pipeline.
+    //
+    // `#[allow(dead_code)]` because the only in-tree caller is gated on
+    // the `return-type-inference` feature.
+    #[allow(dead_code)]
+    pub fn add_module_pass(&mut self, pass: Box<dyn ModulePass>) {
+        self.module_passes.add_pass(pass);
     }
 }

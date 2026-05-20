@@ -3,12 +3,10 @@
 //! This module provides trait implementations and helper functions to convert
 //! AST-level type representations (`ast::TypeSpecifier`, `ast::VarDecl`,
 //! `ast::VarDef`, `ast::VarDeclStmt`) into their corresponding IR-level
-//! data types (`Dtype`), as well as implementations of the `Named` trait
-//! for extracting identifiers from AST declaration nodes.
+//! data types (`Dtype`).
 
 use crate::ast;
 use crate::ir::types::Dtype;
-use crate::ir::value::Named;
 
 /// Converts an optional AST type specifier into the corresponding base IR data type (`Dtype`).
 ///
@@ -34,39 +32,32 @@ fn base_dtype(type_specifier: &Option<ast::TypeSpecifier>) -> Dtype {
     }
 }
 
-// --- `Named` trait implementations ---
-// These allow AST declaration nodes to expose their identifier strings
-// in a uniform way, which is used during IR generation to name variables.
-
-/// Implements `Named` for a variable declaration (without initializer),
-/// returning the declared identifier.
-impl Named for ast::VarDecl {
-    fn identifier(&self) -> Option<String> {
-        Some(self.identifier.clone())
+/// Combines a scalar element type with an AST declaration shape (scalar vs. array)
+/// to produce the storage [`Dtype`] for that declaration.
+///
+/// Shared by the [`Dtype::try_from<&VarDecl>`] path (for globals & parameters)
+/// and by `plan_local_decl_storage` in the function generator, so that the
+/// "wrap with Array if the declaration is array-shaped" rule lives in exactly
+/// one place.
+pub(crate) fn compose_var_decl_dtype(base: Dtype, inner: &ast::VarDeclInner) -> Dtype {
+    match inner {
+        ast::VarDeclInner::Scalar => base,
+        ast::VarDeclInner::Array(arr) => Dtype::array_of(base, arr.len),
     }
 }
 
-/// Implements `Named` for a variable definition (declaration with initializer),
-/// returning the defined identifier.
-impl Named for ast::VarDef {
-    fn identifier(&self) -> Option<String> {
-        Some(self.identifier.clone())
+/// Analogue of [`compose_var_decl_dtype`] for [`ast::VarDef`]s.
+pub(crate) fn compose_var_def_dtype(base: Dtype, inner: &ast::VarDefInner) -> Dtype {
+    match inner {
+        ast::VarDefInner::Scalar(_) => base,
+        ast::VarDefInner::Array(arr) => Dtype::array_of(base, arr.len),
     }
 }
 
-/// Implements `Named` for a variable declaration statement, which may be
-/// either a pure declaration or a definition. Delegates to the inner variant
-/// to retrieve the identifier.
-impl Named for ast::VarDeclStmt {
-    fn identifier(&self) -> Option<String> {
-        match &self.inner {
-            ast::VarDeclStmtInner::Decl(d) => Some(d.identifier.clone()),
-            ast::VarDeclStmtInner::Def(d) => Some(d.identifier.clone()),
-        }
-    }
-}
-
-// --- `From` trait implementations: AST TypeSpecifier -> IR Dtype ---
+// ---------------------------------------------------------------------------
+// `From` trait implementations: AST TypeSpecifier -> IR Dtype
+// ---------------------------------------------------------------------------
+//
 // These provide infallible conversions from AST type specifiers to IR types.
 
 /// Converts an owned `ast::TypeSpecifier` into a `Dtype` by delegating to the
@@ -89,7 +80,7 @@ impl From<&ast::TypeSpecifier> for Dtype {
             ast::TypeSpecifierInner::BuiltIn(ast::BuiltIn::Int) => Self::I32,
             ast::TypeSpecifierInner::BuiltIn(ast::BuiltIn::Float) => Self::F32,
             ast::TypeSpecifierInner::Composite(name) => Self::Struct {
-                type_name: name.to_string(),
+                type_name: name.clone(),
             },
             ast::TypeSpecifierInner::Reference(inner) => Self::ptr_to(Dtype::Array {
                 element: Box::new(Self::from(inner.as_ref())),
@@ -102,7 +93,10 @@ impl From<&ast::TypeSpecifier> for Dtype {
     }
 }
 
-// --- `TryFrom` trait implementations: AST declarations -> IR Dtype ---
+// ---------------------------------------------------------------------------
+// `TryFrom` trait implementations: AST declarations -> IR Dtype
+// ---------------------------------------------------------------------------
+//
 // These are fallible conversions because certain combinations (e.g., struct
 // definitions with initializers) are not supported and produce an error.
 
@@ -115,11 +109,8 @@ impl TryFrom<&ast::VarDecl> for Dtype {
     type Error = crate::ir::Error;
 
     fn try_from(decl: &ast::VarDecl) -> Result<Self, Self::Error> {
-        let base_dtype = base_dtype(&decl.type_specifier);
-        match &decl.inner {
-            ast::VarDeclInner::Array(decl) => Ok(Dtype::array_of(base_dtype, decl.len)),
-            ast::VarDeclInner::Scalar => Ok(base_dtype),
-        }
+        let base = base_dtype(&decl.type_specifier);
+        Ok(compose_var_decl_dtype(base, &decl.inner))
     }
 }
 
@@ -132,15 +123,11 @@ impl TryFrom<&ast::VarDef> for Dtype {
     type Error = crate::ir::Error;
 
     fn try_from(def: &ast::VarDef) -> Result<Self, Self::Error> {
-        // Struct types cannot have inline initializers; reject early.
-        if let Dtype::Struct { .. } = &base_dtype(&def.type_specifier) {
+        let base = base_dtype(&def.type_specifier);
+        if matches!(&base, Dtype::Struct { .. }) {
             return Err(crate::ir::Error::StructInitialization);
         }
-        let base_dtype = base_dtype(&def.type_specifier);
-        match &def.inner {
-            ast::VarDefInner::Array(def) => Ok(Dtype::array_of(base_dtype, def.len)),
-            ast::VarDefInner::Scalar(_) => Ok(base_dtype),
-        }
+        Ok(compose_var_def_dtype(base, &def.inner))
     }
 }
 

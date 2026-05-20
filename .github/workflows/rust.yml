@@ -9,6 +9,11 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+  
 jobs:
   build:
 
@@ -32,24 +37,33 @@ jobs:
 
     - name: Run basic tests
       run: |
-        cargo test --verbose -- \
-          --skip float_basic \
-          --skip float_arith \
-          --skip float_cmp \
-          --skip float_cast \
-          --skip float_func \
-          --skip for_basic \
-          --skip for_continue \
-          --skip for_mixed \
-          --skip for_nested \
-          --skip for_range \
-          --skip struct_method_basic \
-          --skip struct_method_calls \
-          --skip struct_method_namespace \
-          --skip struct_method_loop \
-          --skip struct_method_nested \
-          --skip array_2d_basic \
-          --skip array_2d_init \
-          --skip array_2d_matmul \
-          --skip array_3d \
-          --skip attention
+        cargo test --verbose
+
+  doc:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    needs: build  
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Setup Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Generate rustdoc
+      run: |
+        cargo doc --no-deps --document-private-items
+        echo '<meta http-equiv="refresh" content="0; url=teac/index.html">' > target/doc/index.html
+
+    - name: Upload Pages artifact
+      uses: actions/upload-pages-artifact@v3
+      with:
+        path: target/doc
+
+    - name: Deploy to GitHub Pages
+      id: deployment
+      uses: actions/deploy-pages@v4

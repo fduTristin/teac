@@ -10,15 +10,6 @@ fn mangle_bb(func: &str, bb: usize) -> String {
     format!(".L{func}_bb{bb}")
 }
 
-fn lower_link_symbol(ir_name: &str, target: Target) -> String {
-    let base = if let Some(stripped) = ir_name.strip_prefix("std::") {
-        stripped.to_string()
-    } else {
-        ir_name.replace("::", "__")
-    };
-    target.mangle_symbol(&base)
-}
-
 #[derive(Debug, Clone)]
 pub enum PtrBase {
     Stack,
@@ -120,7 +111,7 @@ impl<'a> FunctionGenerator<'a> {
     }
 
     pub fn emit_cjump(&mut self, s: &ir::stmt::CJumpStmt) -> Result<(), Error> {
-        let cond_v = Self::operand_vreg(&s.dst)?;
+        let cond_v = Self::operand_vreg(&s.cond)?;
         let cond = *self
             .cond_map
             .get(&cond_v)
@@ -190,7 +181,7 @@ impl<'a> FunctionGenerator<'a> {
             self.emit_call_reg_arg(arg, i as u8)?;
         }
 
-        let func_name = lower_link_symbol(&s.func_name, self.target);
+        let func_name = self.target.mangle_symbol(&s.link_name);
         self.insts.push(Inst::Bl { func: func_name });
 
         if nargs > 8 {
@@ -201,10 +192,14 @@ impl<'a> FunctionGenerator<'a> {
         self.insts.push(Inst::RestoreCallerRegs);
 
         if let Some(res) = &s.res {
-            let local = res
-                .as_local()
-                .ok_or_else(|| Error::Internal("call result must be a local operand".into()))?;
-            self.emit_call_result(local)?;
+            match res {
+                ir::Operand::Local(local) => self.emit_call_result(local)?,
+                _ => {
+                    return Err(Error::Internal(
+                        "call result must be a local operand".into(),
+                    ))
+                }
+            }
         }
         Ok(())
     }
@@ -420,8 +415,8 @@ impl<'a> FunctionGenerator<'a> {
         Ok(())
     }
 
-    fn emit_call_result(&mut self, res: &ir::LocalRef) -> Result<(), Error> {
-        let dst = res.index;
+    fn emit_call_result(&mut self, res: &ir::Local) -> Result<(), Error> {
+        let dst = res.id.0;
         match &res.dtype {
             ir::Dtype::I32 => {
                 self.insts.push(Inst::Mov {
@@ -469,19 +464,19 @@ impl<'a> FunctionGenerator<'a> {
 
     fn lower_int(&self, val: &ir::Operand) -> Result<Operand, Error> {
         match val {
-            ir::Operand::Integer(i) => Ok(Operand::Immediate(i.value as i64)),
+            ir::Operand::Const(c) => Ok(Operand::Immediate(c.val)),
             ir::Operand::Local(l) => {
                 if !matches!(l.dtype, ir::Dtype::I1 | ir::Dtype::I32) {
                     return Err(Error::UnsupportedDtype {
                         dtype: l.dtype.clone(),
                     });
                 }
-                if self.frame.has_alloca(l.index) {
+                if self.frame.has_alloca(l.id.0) {
                     return Err(Error::UnsupportedOperand {
-                        what: format!("int operand references alloca pointer %r{}", l.index),
+                        what: format!("int operand references alloca pointer %r{}", l.id.0),
                     });
                 }
-                Ok(Operand::Register(Register::Virtual(l.index)))
+                Ok(Operand::Register(Register::Virtual(l.id.0)))
             }
             ir::Operand::Global(_) => Err(Error::UnsupportedOperand {
                 what: format!("unsupported int operand: {}", val),
@@ -506,16 +501,16 @@ impl<'a> FunctionGenerator<'a> {
 
     fn lower_value(&self, val: &ir::Operand) -> Result<(Operand, RegSize), Error> {
         match val {
-            ir::Operand::Integer(i) => Ok((Operand::Immediate(i.value as i64), RegSize::W32)),
+            ir::Operand::Const(c) => Ok((Operand::Immediate(c.val), RegSize::W32)),
             ir::Operand::Local(l) => {
                 let size = match &l.dtype {
                     ir::Dtype::I1 | ir::Dtype::I32 => RegSize::W32,
                     ir::Dtype::Pointer { .. } => {
-                        if self.frame.has_alloca(l.index) {
+                        if self.frame.has_alloca(l.id.0) {
                             return Err(Error::UnsupportedOperand {
                                 what: format!(
                                     "value operand uses alloca ptr %r{} directly (need address-of)",
-                                    l.index
+                                    l.id.0
                                 ),
                             });
                         }
@@ -527,7 +522,7 @@ impl<'a> FunctionGenerator<'a> {
                         })
                     }
                 };
-                Ok((Operand::Register(Register::Virtual(l.index)), size))
+                Ok((Operand::Register(Register::Virtual(l.id.0)), size))
             }
             ir::Operand::Global(_) => Err(Error::UnsupportedOperand {
                 what: "unexpected global variable in value position".into(),
@@ -556,7 +551,7 @@ impl<'a> FunctionGenerator<'a> {
     fn lower_ptr(&self, val: &ir::Operand) -> Result<(PtrBase, Option<StackSlot>), Error> {
         match val {
             ir::Operand::Local(l) => {
-                let vreg_index = l.index;
+                let vreg_index = l.id.0;
                 // Check if this local is a stack allocation (alloca).
                 // Allocas have their address implicitly defined by their stack slot,
                 // rather than being stored in a register.
@@ -574,10 +569,10 @@ impl<'a> FunctionGenerator<'a> {
                 })
             }
             ir::Operand::Global(g) => Ok((
-                PtrBase::Global(self.target.mangle_symbol(&g.identifier)),
+                PtrBase::Global(self.target.mangle_symbol(&g.name)),
                 None,
             )),
-            ir::Operand::Integer(_) => Err(Error::UnsupportedOperand {
+            ir::Operand::Const(_) => Err(Error::UnsupportedOperand {
                 what: format!("unsupported pointer operand: {}", val),
             }),
         }
@@ -585,19 +580,19 @@ impl<'a> FunctionGenerator<'a> {
 
     fn lower_index(&self, val: &ir::Operand) -> Result<IndexOperand, Error> {
         match val {
-            ir::Operand::Integer(i) => Ok(IndexOperand::Imm(i.value as i64)),
+            ir::Operand::Const(c) => Ok(IndexOperand::Imm(c.val)),
             ir::Operand::Local(l) => {
                 if !matches!(l.dtype, ir::Dtype::I1 | ir::Dtype::I32) {
                     return Err(Error::UnsupportedDtype {
                         dtype: l.dtype.clone(),
                     });
                 }
-                if self.frame.has_alloca(l.index) {
+                if self.frame.has_alloca(l.id.0) {
                     return Err(Error::UnsupportedOperand {
-                        what: format!("index operand references alloca pointer %r{}", l.index),
+                        what: format!("index operand references alloca pointer %r{}", l.id.0),
                     });
                 }
-                Ok(IndexOperand::Reg(Register::Virtual(l.index)))
+                Ok(IndexOperand::Reg(Register::Virtual(l.id.0)))
             }
             ir::Operand::Global(_) => Err(Error::UnsupportedOperand {
                 what: format!("unsupported index operand: {}", val),
@@ -607,7 +602,7 @@ impl<'a> FunctionGenerator<'a> {
 
     fn lower_index_imm(&self, val: &ir::Operand) -> Result<i64, Error> {
         match val {
-            ir::Operand::Integer(i) => Ok(i.value as i64),
+            ir::Operand::Const(c) => Ok(c.val),
             _ => Err(Error::UnsupportedOperand {
                 what: format!("expected immediate struct field index, got: {}", val),
             }),
@@ -645,8 +640,8 @@ impl<'a> FunctionGenerator<'a> {
         let size = dtype_to_regsize(dst.dtype())?;
 
         let src_op = match src {
-            ir::Operand::Integer(i) => Operand::Immediate(i.value as i64),
-            ir::Operand::Local(l) => Operand::Register(Register::Virtual(l.index)),
+            ir::Operand::Const(c) => Operand::Immediate(c.val),
+            ir::Operand::Local(l) => Operand::Register(Register::Virtual(l.id.0)),
             ir::Operand::Global(_) => {
                 return Err(Error::UnsupportedOperand {
                     what: "global variable in phi copy".into(),
@@ -670,9 +665,11 @@ impl<'a> FunctionGenerator<'a> {
     }
 
     fn operand_vreg(op: &ir::Operand) -> Result<usize, Error> {
-        op.vreg_index().ok_or_else(|| Error::UnsupportedOperand {
-            what: format!("expected local variable, got: {}", op),
-        })
+        op.local_id()
+            .map(|id| id.0)
+            .ok_or_else(|| Error::UnsupportedOperand {
+                what: format!("expected local variable, got: {}", op),
+            })
     }
 }
 

@@ -21,7 +21,7 @@
 | -------------- | --------------------------------------------------------------------------------------------------------------------- | -------------------------------------- |
 | **浮点类型 (f32)** | `float_basic`, `float_arith`, `float_cmp`, `float_cast`, `float_func`                                                 | Grammar, AST Types, Parser             |
 | **类型转换 (as)**  | `float_cast`, `float_arith`, `float_func`                                                                             | Grammar, AST Expr, Parser              |
-| **多维数组**       | `array_2d_basic`, `array_2d_init`, `array_2d_matmul`, `array_3d`, `attention`                                         | Grammar, AST Types, Parser             |
+| **多维数组**       | `array_2d_basic`, `array_2d_init`, `array_2d_matmul`, `array_3d`, `array_attention`                                   | Grammar, AST Types, Parser             |
 | **For-In 循环**  | `for_basic`, `for_continue`, `for_mixed`, `for_nested`, `for_range`                                                   | Grammar, AST Stmt, Parser              |
 | **Impl 块与方法**  | `struct_method_basic`, `struct_method_calls`, `struct_method_loop`, `struct_method_namespace`, `struct_method_nested` | Grammar, AST Program/Expr/Stmt, Parser |
 
