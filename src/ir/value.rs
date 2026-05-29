@@ -17,6 +17,31 @@ use super::types::Dtype;
 use std::fmt::{Display, Formatter};
 use std::rc::Rc;
 
+/// A typed floating-point constant operand.
+///
+/// Stored as an `f64` so we can print LLVM's hex-float constant syntax.
+#[derive(Clone)]
+pub struct FloatConst {
+    pub dtype: Dtype,
+    pub val: f64,
+}
+
+impl Display for FloatConst {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        // LLVM prints `float` constants using a 64-bit hex literal.
+        // For `float`-typed constants, the hex bits must correspond to a value
+        // representable in f32 exactly, or LLVM will reject the IR.
+        let bits = match &self.dtype {
+            Dtype::F32 => {
+                let widened = (self.val as f32) as f64;
+                widened.to_bits()
+            }
+            _ => self.val.to_bits(),
+        };
+        write!(f, "0x{:016X}", bits)
+    }
+}
+
 /// Unique identifier of an SSA local (virtual register) within one function.
 ///
 /// `LocalId`s are allocated by [`FunctionGenerator::fresh_local`] and by a
@@ -107,6 +132,7 @@ impl Display for IntConst {
 #[derive(Clone)]
 pub enum Operand {
     Const(IntConst),
+    FloatConst(FloatConst),
     Local(Local),
     Global(GlobalRef),
 }
@@ -116,6 +142,7 @@ impl Operand {
     pub fn dtype(&self) -> &Dtype {
         match self {
             Operand::Const(c) => &c.dtype,
+            Operand::FloatConst(c) => &c.dtype,
             Operand::Local(l) => &l.dtype,
             Operand::Global(g) => &g.dtype,
         }
@@ -143,6 +170,7 @@ impl Display for Operand {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Operand::Const(c) => Display::fmt(c, f),
+            Operand::FloatConst(c) => Display::fmt(c, f),
             Operand::Local(l) => Display::fmt(l, f),
             Operand::Global(g) => Display::fmt(g, f),
         }

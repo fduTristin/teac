@@ -8,7 +8,7 @@
 
 use super::error::Error;
 use super::module::Registry;
-use super::stmt::{ArithBinOp, CmpPredicate, Stmt};
+use super::stmt::{ArithBinOp, CmpPredicate, FCmpPredicate, FloatBinOp, Stmt};
 use super::types::Dtype;
 use super::value::{GlobalDef, GlobalRef, Local, LocalId, Operand};
 use indexmap::IndexMap;
@@ -99,6 +99,8 @@ pub struct FunctionGenerator<'ir> {
     /// For variables declared without an explicit type annotation, this map
     /// provides the inferred concrete type.
     pub resolved_types: HashMap<String, Dtype>,
+    /// Return type of the function currently being lowered.
+    pub current_return_dtype: Dtype,
     /// Map of currently visible local variables, keyed by their source-level name.
     /// Variables are inserted when declared and removed when their enclosing scope
     /// exits.
@@ -139,6 +141,7 @@ impl<'ir> FunctionGenerator<'ir> {
             registry,
             global_variables,
             resolved_types,
+            current_return_dtype: Dtype::I32,
             local_variables: IndexMap::new(),
             scope_locals: Vec::new(),
             irs: Vec::new(),
@@ -290,6 +293,40 @@ impl FunctionGenerator<'_> {
     /// `right`, storing the boolean result in `dst`.
     pub fn emit_cmp(&mut self, op: CmpPredicate, left: Operand, right: Operand, dst: Operand) {
         self.irs.push(Stmt::as_cmp(op, left, right, dst));
+    }
+
+    /// Emits a floating-point arithmetic binary operation (`op`) on `left` and `right`,
+    /// storing the result in `dst`.
+    pub fn emit_fbiop(
+        &mut self,
+        op: FloatBinOp,
+        left: Operand,
+        right: Operand,
+        dst: Operand,
+    ) {
+        self.irs.push(Stmt::as_fbiop(op, left, right, dst));
+    }
+
+    /// Emits a floating-point comparison instruction using predicate `op` on `left` and
+    /// `right`, storing the boolean result in `dst`.
+    pub fn emit_fcmp(
+        &mut self,
+        op: FCmpPredicate,
+        left: Operand,
+        right: Operand,
+        dst: Operand,
+    ) {
+        self.irs.push(Stmt::as_fcmp(op, left, right, dst));
+    }
+
+    /// Emits a signed-int to float conversion (`sitofp`) from `src` to `dst`.
+    pub fn emit_sitofp(&mut self, src: Operand, dst: Operand) {
+        self.irs.push(Stmt::as_sitofp(src, dst));
+    }
+
+    /// Emits a float to signed-int conversion (`fptosi`) from `src` to `dst`.
+    pub fn emit_fptosi(&mut self, src: Operand, dst: Operand) {
+        self.irs.push(Stmt::as_fptosi(src, dst));
     }
 
     /// Emits a conditional branch instruction that jumps to `true_label` when `cond`

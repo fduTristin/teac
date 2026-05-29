@@ -335,9 +335,14 @@ impl TypeInference<'_> {
         self.type_of_range_bound(&stmt.end)?;
 
         let mut body_ctx = self.fork(self.env.clone());
-        body_ctx.env.insert(stmt.iter_var.clone(), VarState::Resolved(Dtype::I32));
+        body_ctx
+            .env
+            .insert(stmt.iter_var.clone(), VarState::Resolved(Dtype::I32));
         body_ctx.process_stmts(&stmt.stmts)?;
-        let body_env = body_ctx.env;
+        let mut body_env = body_ctx.env;
+
+        // Loop variable does not escape the loop body.
+        body_env.remove(&stmt.iter_var);
 
         self.merge_env_single(&body_env)?;
         Ok(())
@@ -441,9 +446,13 @@ impl TypeInference<'_> {
     fn type_of_arith_expr(&self, expr: &ast::ArithExpr) -> Result<Dtype, Error> {
         match &expr.inner {
             ast::ArithExprInner::ArithBiOpExpr(biop) => {
-                self.type_of_arith_expr(&biop.left)?;
-                self.type_of_arith_expr(&biop.right)?;
-                Ok(Dtype::I32)
+                let left_type = self.type_of_arith_expr(&biop.left)?;
+                let right_type = self.type_of_arith_expr(&biop.right)?;
+                if matches!(left_type, Dtype::F32) || matches!(right_type, Dtype::F32) {
+                    Ok(Dtype::F32)
+                } else {
+                    Ok(Dtype::I32)
+                }
             }
             ast::ArithExprInner::ExprUnit(unit) => self.type_of_expr_unit(unit),
         }
