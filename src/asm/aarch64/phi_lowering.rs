@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use crate::ir::function::{BasicBlock, BlockLabel};
 use crate::ir::stmt::{PhiStmt, Stmt, StmtInner};
-use crate::ir::Operand;
+use crate::ir::{Operand, types::Dtype, value::FloatConst};
 use crate::opt::cfg::Cfg;
 
 /// Plan for destroying SSA form in one function: the block bodies with
@@ -66,7 +66,18 @@ fn build_parallel_copies(phis: &[PhiStmt], pred_label: &BlockLabel) -> Vec<Paral
                 .iter()
                 .find(|(label, _)| label.key() == pred_key)
                 .map(|(_, val)| val.clone())
-                .unwrap_or_else(|| Operand::from(0));
+                .unwrap_or_else(|| {
+                    // Fallback: create a zero value matching the phi dst dtype.
+                    // If the incoming is missing (shouldn't happen in well-formed IR),
+                    // use zero: 0 for integers, 0.0 for floats.
+                    match phi.dst.dtype() {
+                        Dtype::F32 => Operand::FloatConst(FloatConst {
+                            dtype: Dtype::F32,
+                            val: 0.0,
+                        }),
+                        _ => Operand::from(0),
+                    }
+                });
 
             ParallelCopy {
                 dst: phi.dst.clone(),
@@ -91,6 +102,7 @@ pub fn find_ready_copy(copies: &[ParallelCopy]) -> Option<usize> {
 pub fn same_operand(lhs: &Operand, rhs: &Operand) -> bool {
     match (lhs, rhs) {
         (Operand::Const(l), Operand::Const(r)) => l.val == r.val,
+        (Operand::FloatConst(l), Operand::FloatConst(r)) => l.val == r.val,
         (Operand::Local(l), Operand::Local(r)) => l.id == r.id,
         (Operand::Global(l), Operand::Global(r)) => l.name == r.name,
         _ => false,

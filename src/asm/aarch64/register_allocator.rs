@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use super::frame::FrameLayout;
 use super::inst::Instruction;
-use super::types::{Addr, IndexOperand, Operand, RegisterSize, Register, SCRATCH0, SCRATCH1};
+use super::types::{Addr, IndexOperand, Operand, RegisterClass, RegisterSize, Register, SCRATCH0, SCRATCH1};
 use crate::asm::common::StackSlot;
 use crate::asm::error::Error;
 use crate::common::bitset::Bitset;
@@ -88,7 +88,7 @@ impl<'a> RegisterAllocator<'a> {
     /// can read back the final frame size.
     pub fn run(mut self) -> Result<Vec<Instruction>, Error> {
         let alloc = self.allocate();
-        InstRewriter::new(&alloc).rewrite(self.insts)
+        InstRewriter::new(&alloc, self.frame).rewrite(self.insts)
     }
 
     /// Colours the virtual registers and reserves a frame spill slot for
@@ -107,30 +107,57 @@ impl<'a> RegisterAllocator<'a> {
 
         let cfg = Graph::from_nodes(self.insts);
         let (gen, kill, present, vreg_sizes) = build_gen_kill(self.insts, num_vregs);
-
-        // Floating-point vregs (the S32 width is the sole Fpr class) must be
-        // coloured against ALLOCATABLE_FPRS on their own interference
-        // (sub)graph; the colouring below only knows the integer pool
-        // ALLOCATABLE_REGS.  See asmt-4.md §3.4.
-        if vreg_sizes.values().any(|size| *size == RegisterSize::S32) {
-            todo!(
-                "asmt-4: split the interference graph by RegisterClass and \
-                 colour Fpr vregs against ALLOCATABLE_FPRS (s18-s25); \
-                 see asmt-4.md §3.4"
-            );
-        }
-
         let liveness = BackwardLiveness::compute(&gen, &kill, &cfg, Bitset::new(num_vregs));
-        let mut graph = InterferenceGraph::build(self.insts, &liveness, &present, num_vregs);
-        let Coloring { coloring, spilled } = graph.color();
 
-        let mut locations = HashMap::with_capacity(coloring.len() + spilled.len());
-        for (vreg, color) in coloring {
-            locations.insert(vreg, Location::Register(color));
+        // Build the full interference graph (cross-class edges are absent since
+        // Gpr and Fpr vregs never share an instruction, but we build one graph
+        // and split by class during colouring).
+        let full_graph = InterferenceGraph::build(self.insts, &liveness, &present, num_vregs, &vreg_sizes);
+
+        let mut locations = HashMap::with_capacity(num_vregs);
+
+        // Colour Gpr vregs against ALLOCATABLE_REGS (x8-x15).
+        let gpr_present: Bitset = {
+            let mut bs = Bitset::new(num_vregs);
+            for v in present.iter() {
+                if vreg_sizes.get(&v).map_or(false, |s| s.class() == RegisterClass::Gpr) {
+                    bs.insert(v);
+                }
+            }
+            bs
+        };
+        if !gpr_present.is_empty() {
+            let mut gpr_graph = full_graph.subgraph(&gpr_present);
+            let Coloring { coloring: gpr_coloring, spilled: gpr_spilled } = gpr_graph.color(&ALLOCATABLE_REGS);
+            for (vreg, color) in gpr_coloring {
+                locations.insert(vreg, Location::Register(color));
+            }
+            for vreg in gpr_spilled {
+                let size = *vreg_sizes.get(&vreg).unwrap_or(&RegisterSize::X64);
+                locations.insert(vreg, Location::Spill(self.frame.alloc_spill(size)));
+            }
         }
-        for vreg in spilled {
-            let size = vreg_sizes.get(&vreg).copied().unwrap_or(RegisterSize::X64);
-            locations.insert(vreg, Location::Spill(self.frame.alloc_spill(size)));
+
+        // Colour Fpr vregs against ALLOCATABLE_FPRS (s18-s25).
+        let fpr_present: Bitset = {
+            let mut bs = Bitset::new(num_vregs);
+            for v in present.iter() {
+                if vreg_sizes.get(&v).map_or(false, |s| s.class() == RegisterClass::Fpr) {
+                    bs.insert(v);
+                }
+            }
+            bs
+        };
+        if !fpr_present.is_empty() {
+            let mut fpr_graph = full_graph.subgraph(&fpr_present);
+            let Coloring { coloring: fpr_coloring, spilled: fpr_spilled } = fpr_graph.color(&ALLOCATABLE_FPRS);
+            for (vreg, color) in fpr_coloring {
+                locations.insert(vreg, Location::Register(color));
+            }
+            for vreg in fpr_spilled {
+                let size = *vreg_sizes.get(&vreg).unwrap_or(&RegisterSize::S32);
+                locations.insert(vreg, Location::Spill(self.frame.alloc_spill(size)));
+            }
         }
 
         RegisterAllocation { locations }
@@ -209,17 +236,22 @@ impl InterferenceGraph {
         liveness: &BackwardLiveness<Bitset>,
         present: &Bitset,
         num_vregs: usize,
+        vreg_sizes: &HashMap<usize, RegisterSize>,
     ) -> Self {
         let mut adjacency: Vec<Bitset> = (0..num_vregs).map(|_| Bitset::new(num_vregs)).collect();
 
         for (i, inst) in instructions.iter().enumerate() {
             let live_out = &liveness.live_out[i];
-            if let Some((d, _)) = inst.defined_vreg_with_size() {
-                adjacency[d].union_with(live_out);
-                adjacency[d].remove(d);
+            if let Some((d, d_size)) = inst.defined_vreg_with_size() {
                 for r in live_out.iter() {
+                    let r_size = vreg_sizes.get(&r);
                     if r != d {
-                        adjacency[r].insert(d);
+                        if r_size.map_or(true, |rs| {
+                            rs.class() == d_size.class()
+                        }) {
+                            adjacency[d].insert(r);
+                            adjacency[r].insert(d);
+                        }
                     }
                 }
             }
@@ -235,16 +267,34 @@ impl InterferenceGraph {
         self.adjacency[v].len()
     }
 
-    fn color(&mut self) -> Coloring {
+    /// Returns a new interference graph containing only the vregs in `sub_present`.
+    fn subgraph(&self, sub_present: &Bitset) -> Self {
+        let n = self.adjacency.len();
+        let mut adjacency: Vec<Bitset> = (0..n).map(|_| Bitset::new(n)).collect();
+        for v in sub_present.iter() {
+            for u in self.adjacency[v].iter() {
+                if sub_present.contains(u) {
+                    adjacency[v].insert(u);
+                }
+            }
+        }
+        Self {
+            present: sub_present.clone(),
+            adjacency,
+        }
+    }
+
+    fn color(&mut self, allocatable: &[u8]) -> Coloring {
         if self.present.is_empty() {
             return Coloring::empty();
         }
 
-        let (stack, potential_spills) = self.simplify();
-        self.select(stack, potential_spills)
+        let num_colors = allocatable.len();
+        let (stack, potential_spills) = self.simplify(num_colors);
+        self.select(stack, potential_spills, allocatable, num_colors)
     }
 
-    fn simplify(&mut self) -> (Vec<usize>, HashSet<usize>) {
+    fn simplify(&mut self, num_colors: usize) -> (Vec<usize>, HashSet<usize>) {
         let n = self.adjacency.len();
         let total_nodes = self.present.len();
 
@@ -254,7 +304,7 @@ impl InterferenceGraph {
 
         let mut low_degree: VecDeque<usize> = VecDeque::new();
         for v in self.present.iter() {
-            if degree[v] < NUM_COLORS {
+            if degree[v] < num_colors {
                 low_degree.push_back(v);
                 in_low.insert(v);
             }
@@ -281,7 +331,7 @@ impl InterferenceGraph {
                 }
                 if degree[u] > 0 {
                     degree[u] -= 1;
-                    if degree[u] < NUM_COLORS && !in_low.contains(u) {
+                    if degree[u] < num_colors && !in_low.contains(u) {
                         low_degree.push_back(u);
                         in_low.insert(u);
                     }
@@ -318,23 +368,26 @@ impl InterferenceGraph {
         v
     }
 
-    fn select(&self, mut stack: Vec<usize>, potential_spills: HashSet<usize>) -> Coloring {
+    fn select(&self, mut stack: Vec<usize>, potential_spills: HashSet<usize>, allocatable: &[u8], _num_colors: usize) -> Coloring {
         let mut coloring: HashMap<usize, u8> = HashMap::new();
         let mut spilled: Vec<usize> = Vec::new();
+        let base = allocatable[0];
 
         while let Some(v) = stack.pop() {
             let mut used_colors: u32 = 0;
             for u in self.adjacency[v].iter() {
                 if let Some(&c) = coloring.get(&u) {
-                    used_colors |= 1u32 << c;
+                    // c is a physical register number (18..25), convert to
+                    // a 0-based index for the bitmask.
+                    used_colors |= 1u32 << (c - base);
                 }
             }
 
-            if let Some(&color) = ALLOCATABLE_REGS
+            let color_idx = allocatable
                 .iter()
-                .find(|c| used_colors & (1u32 << **c) == 0)
-            {
-                coloring.insert(v, color);
+                .position(|c| used_colors & (1u32 << (c - base)) == 0);
+            if let Some(idx) = color_idx {
+                coloring.insert(v, allocatable[idx]);
             } else {
                 spilled.push(v);
             }
@@ -349,13 +402,15 @@ impl InterferenceGraph {
 struct InstRewriter<'a> {
     alloc: &'a RegisterAllocation,
     output: Vec<Instruction>,
+    frame: &'a mut FrameLayout,
 }
 
 impl<'a> InstRewriter<'a> {
-    fn new(alloc: &'a RegisterAllocation) -> Self {
+    fn new(alloc: &'a RegisterAllocation, frame: &'a mut FrameLayout) -> Self {
         Self {
             alloc,
             output: Vec::new(),
+            frame,
         }
     }
 
@@ -443,20 +498,12 @@ impl<'a> InstRewriter<'a> {
                 lhs,
                 rhs,
             } => self.rewrite_binop(*op, *size, *dst, *lhs, *rhs)?,
-            Instruction::FBinOp { .. } => {
-                todo!("asmt-4: rewrite Inst::FBinOp through the Fpr colouring + spill path")
-            }
+            Instruction::FBinOp { op, dst, lhs, rhs } => self.rewrite_fbinop(*op, *dst, *lhs, *rhs)?,
             Instruction::Cmp { size, lhs, rhs } => self.rewrite_cmp(*size, *lhs, *rhs)?,
-            Instruction::FCmp { .. } => todo!("asmt-4: rewrite Inst::FCmp through the Fpr path"),
-            Instruction::Scvtf { .. } => {
-                todo!("asmt-4: rewrite Inst::Scvtf — dst is Fpr, src is Gpr")
-            }
-            Instruction::Fcvtzs { .. } => {
-                todo!("asmt-4: rewrite Inst::Fcvtzs — dst is Gpr, src is Fpr")
-            }
-            Instruction::Fmov { .. } => {
-                todo!("asmt-4: rewrite Inst::Fmov — dst is Fpr, src may be Fpr or Gpr")
-            }
+            Instruction::FCmp { lhs, rhs } => self.rewrite_fcmp(*lhs, *rhs)?,
+            Instruction::Scvtf { dst, src } => self.rewrite_scvtf(*dst, *src)?,
+            Instruction::Fcvtzs { dst, src } => self.rewrite_fcvtzs(*dst, *src)?,
+            Instruction::Fmov { dst, src } => self.rewrite_fmov(*dst, *src)?,
             Instruction::Ldr { size, dst, addr } => self.rewrite_ldr(*size, *dst, addr)?,
             Instruction::Str { size, src, addr } => self.rewrite_str(*size, *src, addr)?,
             Instruction::Lea { dst, addr } => self.rewrite_lea(*dst, addr)?,
@@ -533,6 +580,96 @@ impl<'a> InstRewriter<'a> {
             rhs: rhs_op,
         });
         Ok(())
+    }
+
+    fn rewrite_fbinop(
+        &mut self,
+        op: super::types::FBinOp,
+        dst: Register,
+        lhs: Register,
+        rhs: Register,
+    ) -> Result<(), Error> {
+        // Load lhs into F_SCRATCH0 (s16), rhs into F_SCRATCH1 (s17).
+        // When lhs_reg == rhs_reg (same physical register), the second load
+        // clobbered the first.  We saved rhs's clobbered value to a temp slot;
+        // swap so lhs_reg holds lhs's value and rhs_reg holds rhs's value.
+        let lhs_reg = self.load_src_reg(lhs, RegisterSize::S32, F_SCRATCH0)?;
+        let rhs_reg = self.load_src_reg(rhs, RegisterSize::S32, F_SCRATCH1)?;
+
+        let (final_lhs, final_rhs) = if lhs_reg == rhs_reg {
+            // s16 has rhs (clobbered lhs), s17 has rhs (saved). Swap.
+            let tmp_slot = self.alloc_temp_slot();
+            self.emit_spill_store(tmp_slot, RegisterSize::S32, F_SCRATCH0);
+            self.emit_spill_load(tmp_slot, RegisterSize::S32, F_SCRATCH1);
+            (Register::Physical(F_SCRATCH1), Register::Physical(F_SCRATCH0))
+        } else {
+            (lhs_reg, rhs_reg)
+        };
+
+        self.write_to_dst(dst, RegisterSize::S32, F_SCRATCH0, |final_dst| {
+            Instruction::FBinOp {
+                op,
+                dst: final_dst,
+                lhs: final_lhs,
+                rhs: final_rhs,
+            }
+        })
+    }
+
+    fn alloc_temp_slot(&mut self) -> crate::asm::common::StackSlot {
+        self.frame.alloc_spill(RegisterSize::S32)
+    }
+
+    fn rewrite_fcmp(&mut self, lhs: Register, rhs: Register) -> Result<(), Error> {
+        let lhs_reg = self.load_src_reg(lhs, RegisterSize::S32, F_SCRATCH0)?;
+        let rhs_reg = self.load_src_reg(rhs, RegisterSize::S32, F_SCRATCH1)?;
+
+        // If both sources alias to the same physical register, the second load
+        // clobbered the first.  We saved rhs's clobbered value to a temp slot;
+        // swap so lhs_reg holds lhs's value and rhs_reg holds rhs's value.
+        let (final_lhs, final_rhs) = if lhs_reg == rhs_reg {
+            let tmp_slot = self.alloc_temp_slot();
+            // s16 currently has rhs's value (clobbered), s17 has rhs's saved value.
+            // Swap: put lhs's value in s17, rhs's value in s16.
+            self.emit_spill_store(tmp_slot, RegisterSize::S32, F_SCRATCH0);
+            self.emit_spill_load(tmp_slot, RegisterSize::S32, F_SCRATCH1);
+            (Register::Physical(F_SCRATCH1), Register::Physical(F_SCRATCH0))
+        } else {
+            (lhs_reg, rhs_reg)
+        };
+
+        self.output.push(Instruction::FCmp {
+            lhs: final_lhs,
+            rhs: final_rhs,
+        });
+        Ok(())
+    }
+
+    fn rewrite_scvtf(&mut self, dst: Register, src: Register) -> Result<(), Error> {
+        let src_reg = self.load_src_reg(src, RegisterSize::W32, SCRATCH0)?;
+
+        self.write_to_dst(dst, RegisterSize::S32, F_SCRATCH0, |final_dst| Instruction::Scvtf {
+            dst: final_dst,
+            src: src_reg,
+        })
+    }
+
+    fn rewrite_fcvtzs(&mut self, dst: Register, src: Register) -> Result<(), Error> {
+        let src_reg = self.load_src_reg(src, RegisterSize::S32, F_SCRATCH0)?;
+
+        self.write_to_dst(dst, RegisterSize::W32, SCRATCH0, |final_dst| Instruction::Fcvtzs {
+            dst: final_dst,
+            src: src_reg,
+        })
+    }
+
+    fn rewrite_fmov(&mut self, dst: Register, src: Operand) -> Result<(), Error> {
+        let src_op = self.load_src_operand(src, RegisterSize::S32, F_SCRATCH1)?;
+
+        self.write_to_dst(dst, RegisterSize::S32, F_SCRATCH0, |final_dst| Instruction::Fmov {
+            dst: final_dst,
+            src: src_op,
+        })
     }
 
     fn rewrite_ldr(&mut self, size: RegisterSize, dst: Register, addr: &Addr) -> Result<(), Error> {

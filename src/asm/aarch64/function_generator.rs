@@ -3,7 +3,7 @@ use super::frame::{outgoing_arg_addr, outgoing_stack_bytes, FrameLayout};
 use super::inst::Instruction;
 use super::phi_lowering::{self, ParallelCopy, SplitEdge};
 use super::types::{
-    Addr, BinOp, Cond, IndexOperand, Operand, Register, RegisterSize, REG_IP0, REG_X0,
+    Addr, BinOp, Cond, FBinOp, IndexOperand, Operand, Register, RegisterSize, REG_IP0, REG_S0, REG_X0,
 };
 use crate::asm::common::{StackSlot, StructLayouts};
 use crate::asm::error::Error;
@@ -228,6 +228,58 @@ impl<'a> FunctionGenerator<'a> {
             size: RegisterSize::W32,
             lhs,
             rhs,
+        });
+        Ok(())
+    }
+
+    pub fn emit_fbiop(&mut self, s: &ir::stmt::FBiOpStmt) -> Result<(), Error> {
+        let dst = Self::operand_vreg(&s.dst)?;
+
+        let lhs = self.lower_float_to_reg(&s.left)?;
+        let rhs = self.lower_float_to_reg(&s.right)?;
+        let op = float_arith_op_to_fbinop(&s.kind);
+
+        self.insts.push(Instruction::FBinOp {
+            op,
+            dst: Register::Virtual(dst),
+            lhs,
+            rhs,
+        });
+        Ok(())
+    }
+
+    pub fn emit_fcmp(&mut self, s: &ir::stmt::FCmpStmt) -> Result<(), Error> {
+        let dst = Self::operand_vreg(&s.dst)?;
+        let lhs = self.lower_float_to_reg(&s.left)?;
+        let rhs = self.lower_float_to_reg(&s.right)?;
+        let cond = float_cmp_op_to_cond(&s.kind);
+
+        self.cond_map.insert(dst, cond);
+        self.insts.push(Instruction::FCmp {
+            lhs,
+            rhs,
+        });
+        Ok(())
+    }
+
+    pub fn emit_sitofp(&mut self, s: &ir::stmt::SIToFPStmt) -> Result<(), Error> {
+        let dst = Self::operand_vreg(&s.dst)?;
+        let src = self.lower_int_to_reg(&s.src)?;
+
+        self.insts.push(Instruction::Scvtf {
+            dst: Register::Virtual(dst),
+            src,
+        });
+        Ok(())
+    }
+
+    pub fn emit_fptosi(&mut self, s: &ir::stmt::FPToSIStmt) -> Result<(), Error> {
+        let dst = Self::operand_vreg(&s.dst)?;
+        let src = self.lower_float_to_reg(&s.src)?;
+
+        self.insts.push(Instruction::Fcvtzs {
+            dst: Register::Virtual(dst),
+            src,
         });
         Ok(())
     }
@@ -496,11 +548,11 @@ impl<'a> FunctionGenerator<'a> {
     /// pointer / array short-circuit in [`Self::emit_gpr_arg`] does
     /// not apply because no TeaLang pointer is ever AAPCS64-routed
     /// through the FPR file.
-    fn emit_fpr_arg(&mut self, _arg: &ir::Operand, _reg_idx: u8) -> Result<(), Error> {
-        todo!(
-            "asmt-4: settle an f32 argument into the FPR slot `s{{reg_idx}}` via fmov; \
-             see asmt-4.md §3.3"
-        )
+    fn emit_fpr_arg(&mut self, arg: &ir::Operand, reg_idx: u8) -> Result<(), Error> {
+        let dst = Register::Physical(reg_idx);
+        let (op, _size) = self.lower_value(arg)?;
+        self.insts.push(Instruction::Fmov { dst, src: op });
+        Ok(())
     }
 
     /// Writes `arg` into the caller's outgoing-arg area at
@@ -623,6 +675,45 @@ impl<'a> FunctionGenerator<'a> {
         }
     }
 
+    fn lower_float(&self, val: &ir::Operand) -> Result<Operand, Error> {
+        match val {
+            ir::Operand::FloatConst(c) => {
+                let bits = (c.val as f32).to_bits() as i64;
+                Ok(Operand::Immediate(bits))
+            }
+            ir::Operand::Local(l) => {
+                if !matches!(l.dtype, ir::Dtype::F32) {
+                    return Err(Error::UnsupportedDtype {
+                        dtype: l.dtype.clone(),
+                    });
+                }
+                if self.frame.has_alloca(l.id.0) {
+                    return Err(Error::UnsupportedOperand {
+                        what: format!("float operand references alloca pointer %r{}", l.id.0),
+                    });
+                }
+                Ok(Operand::Register(Register::Virtual(l.id.0)))
+            }
+            ir::Operand::Const(_) | ir::Operand::Global(_) => Err(Error::UnsupportedOperand {
+                what: format!("unsupported float operand: {}", val),
+            }),
+        }
+    }
+
+    fn lower_float_to_reg(&mut self, val: &ir::Operand) -> Result<Register, Error> {
+        match self.lower_float(val)? {
+            Operand::Register(r) => Ok(r),
+            Operand::Immediate(bits) => {
+                let tmp = self.fresh_vreg();
+                self.insts.push(Instruction::Fmov {
+                    dst: Register::Virtual(tmp),
+                    src: Operand::Immediate(bits),
+                });
+                Ok(Register::Virtual(tmp))
+            }
+        }
+    }
+
     fn lower_value(&self, val: &ir::Operand) -> Result<(Operand, RegisterSize), Error> {
         match val {
             ir::Operand::Const(c) => Ok((Operand::Immediate(c.val), RegisterSize::W32)),
@@ -652,9 +743,10 @@ impl<'a> FunctionGenerator<'a> {
             ir::Operand::Global(_) => Err(Error::UnsupportedOperand {
                 what: "unexpected global variable in value position".into(),
             }),
-            ir::Operand::FloatConst(_) => Err(Error::UnsupportedOperand {
-                what: "float constant in value position (use load imm then fmov)".into(),
-            }),
+            ir::Operand::FloatConst(c) => {
+                let bits = (c.val as f32).to_bits() as i64;
+                Ok((Operand::Immediate(bits), RegisterSize::S32))
+            }
         }
     }
 
@@ -763,18 +855,10 @@ impl<'a> FunctionGenerator<'a> {
             Phi(_) => Err(Error::Internal(
                 "phi nodes should be lowered before assembly emission".into(),
             )),
-            FBiOp(_) => Err(Error::Internal(
-                "FBiOp: floating-point operations not yet implemented in aarch64 backend".into(),
-            )),
-            FCmp(_) => Err(Error::Internal(
-                "FCmp: floating-point comparisons not yet implemented in aarch64 backend".into(),
-            )),
-            SIToFP(_) => Err(Error::Internal(
-                "SIToFP: int-to-float conversion not yet implemented in aarch64 backend".into(),
-            )),
-            FPToSI(_) => Err(Error::Internal(
-                "FPToSI: float-to-int conversion not yet implemented in aarch64 backend".into(),
-            )),
+            FBiOp(s) => self.emit_fbiop(s),
+            FCmp(s) => self.emit_fcmp(s),
+            SIToFP(s) => self.emit_sitofp(s),
+            FPToSI(s) => self.emit_fptosi(s),
         }
     }
 
@@ -803,10 +887,10 @@ impl<'a> FunctionGenerator<'a> {
                 dst: Register::Virtual(dst_vreg),
                 src: src_op,
             },
-            RegisterSize::S32 => todo!(
-                "asmt-4: lower an f32 phi copy to `fmov` — `mov` is invalid \
-                 between FP registers; see asmt-4.md §3.6"
-            ),
+            RegisterSize::S32 => Instruction::Fmov {
+                dst: Register::Virtual(dst_vreg),
+                src: src_op,
+            },
         };
         self.insts.push(inst);
         Ok(())
@@ -849,10 +933,10 @@ fn return_inst(size: RegisterSize, src: Operand) -> Instruction {
             dst: Register::Physical(REG_X0),
             src,
         },
-        RegisterSize::S32 => todo!(
-            "asmt-4: place an f32 return value into the FP return register `s0` \
-             via fmov; see asmt-4.md §3.3"
-        ),
+        RegisterSize::S32 => Instruction::Fmov {
+            dst: Register::Physical(REG_S0),
+            src,
+        },
     }
 }
 
@@ -865,10 +949,10 @@ fn return_value_load(size: RegisterSize, dst: Register) -> Instruction {
             dst,
             src: Operand::Register(Register::Physical(REG_X0)),
         },
-        RegisterSize::S32 => todo!(
-            "asmt-4: lift an f32 call result out of the FP return register `s0` \
-             into `dst` via fmov; see asmt-4.md §3.3"
-        ),
+        RegisterSize::S32 => Instruction::Fmov {
+            dst,
+            src: Operand::Register(Register::Physical(REG_S0)),
+        },
     }
 }
 
@@ -880,5 +964,25 @@ fn cmp_op_to_cond(op: &ir::stmt::CmpPredicate) -> Cond {
         ir::stmt::CmpPredicate::Sle => Cond::Le,
         ir::stmt::CmpPredicate::Sgt => Cond::Gt,
         ir::stmt::CmpPredicate::Sge => Cond::Ge,
+    }
+}
+
+fn float_arith_op_to_fbinop(op: &ir::stmt::FloatBinOp) -> FBinOp {
+    match op {
+        ir::stmt::FloatBinOp::FAdd => FBinOp::FAdd,
+        ir::stmt::FloatBinOp::FSub => FBinOp::FSub,
+        ir::stmt::FloatBinOp::FMul => FBinOp::FMul,
+        ir::stmt::FloatBinOp::FDiv => FBinOp::FDiv,
+    }
+}
+
+fn float_cmp_op_to_cond(op: &ir::stmt::FCmpPredicate) -> Cond {
+    match op {
+        ir::stmt::FCmpPredicate::OEq => Cond::Eq,
+        ir::stmt::FCmpPredicate::ONe => Cond::Ne,
+        ir::stmt::FCmpPredicate::OGt => Cond::Gt,
+        ir::stmt::FCmpPredicate::OGe => Cond::Ge,
+        ir::stmt::FCmpPredicate::OLt => Cond::Lt,
+        ir::stmt::FCmpPredicate::OLe => Cond::Le,
     }
 }
